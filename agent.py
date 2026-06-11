@@ -47,9 +47,6 @@ SYSTEM = (
 
 
 def run_bash(command: str) -> str:
-    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-    if any(d in command for d in dangerous):
-        return "Error: Dangerous command blocked"
     try:
         r = subprocess.run(
             command,
@@ -192,6 +189,66 @@ TOOL_HANDLERS = {
     "glob": run_glob,
 }
 
+# Gate 1: Hard deny list — always forbidden
+DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
+
+
+def check_deny_list(command: str) -> str | None:
+    for pattern in DENY_LIST:
+        if pattern in command:
+            return f"Blocked: '{pattern}' is on the deny list"
+    return None
+
+
+# Gate 2: Rule matching — context-dependent checks
+PERMISSION_RULES = [
+    {
+        "tools": ["write_file", "edit_file"],
+        "check": lambda args: not (WORKDIR / args.get("path", ""))
+        .resolve()
+        .is_relative_to(WORKDIR),
+        "message": "Writing outside workspace",
+    },
+    {
+        "tools": ["bash"],
+        "check": lambda args: any(
+            kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]
+        ),
+        "message": "Potentially destructive command",
+    },
+]
+
+
+def check_rules(tool_name: str, args: dict) -> str | None:
+    for rule in PERMISSION_RULES:
+        if tool_name in rule["tools"] and rule["check"](args):
+            return rule["message"]
+    return None
+
+
+# Gate 3: User approval — wait for confirmation after rule match
+def ask_user(tool_name: str, args: dict, reason: str) -> str:
+    print(f"\n\033[33m⚠  {reason}\033[0m")
+    print(f"   Tool: {tool_name}({args})")
+    choice = input("   Allow? [y/N] ").strip().lower()
+    return "allow" if choice in ("y", "yes") else "deny"
+
+
+# Pipeline: all three gates chained
+def check_permission(block) -> bool:
+    if block.name == "bash":
+        reason = check_deny_list(block.input.get("command", ""))
+        if reason:
+            print(f"\n\033[31m⛔ {reason}\033[0m")
+            return False
+    reason = check_rules(block.name, block.input)
+    if reason:
+        decision = ask_user(block.name, block.input, reason)
+        if decision == "deny":
+            return False
+    return True
+
+
 
 def agent_loop(messages: list):
     while True:
@@ -213,16 +270,25 @@ def agent_loop(messages: list):
         # Execute each tool call, collect results
         results = []
         for block in response.content:
-            if block.type == "tool_use":
-                print(f"\033[33m> {block.name}\033[0m")
-                handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown: {block.name}"
-                print(str(output)[:200])
-                results.append(
-                    {"type": "tool_result", "tool_use_id": block.id, "content": output}
-                )
+            if block.type != "tool_use":
+                continue
 
-                # Feed tool results back, loop continues
+            print(f"\033[33m> {block.name}\033[0m")
+
+            # s03 change: run through permission pipeline before executing
+            if not check_permission(block):
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": "Permission denied."})
+                continue
+
+            handler = TOOL_HANDLERS.get(block.name)
+            output = handler(**block.input) if handler else f"Unknown: {block.name}"
+            print(str(output)[:200])
+            results.append(
+                {"type": "tool_result", "tool_use_id": block.id, "content": output}
+            )
+
+        # Feed tool results back, loop continues
         messages.append({"role": "user", "content": results})
 
 
