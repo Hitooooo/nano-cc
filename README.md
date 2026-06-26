@@ -40,4 +40,3 @@ python agent.py
 ### 依赖说明
 - `anthropic` - Anthropic API 客户端
 - `python-dotenv` - 环境变量管理
-- `pyyaml` - YAML 配置文件解析

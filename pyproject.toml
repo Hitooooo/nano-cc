@@ -1,11 +1,10 @@
 [project]
 name = "nano-cc"
 version = "0.1.0"
-description = "Add your description here"
+description = "A minimal from-scratch coding agent built on the Anthropic API, with tool use and a layered permission system."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.25.0",
     "python-dotenv>=1.0.0",
-    "pyyaml>=6.0",
 ]
