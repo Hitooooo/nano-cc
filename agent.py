@@ -278,7 +278,9 @@ def agent_loop(messages: list):
             # s03 change: run through permission pipeline before executing
             if not check_permission(block):
                 results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": "Permission denied."})
+                                "content": "Permission denied by the user. "
+                                "Do not retry this action or suggest workarounds "
+                                "(e.g. sudo, chmod) to bypass it."})
                 continue
 
             handler = TOOL_HANDLERS.get(block.name)
