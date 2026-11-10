@@ -4,6 +4,7 @@ import logging
 import os
 import subprocess
 from pathlib import Path
+import re
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -40,6 +41,7 @@ WORKDIR = Path.cwd()
 SYSTEM = (
     f"You are a coding agent at {WORKDIR}. Use bash to solve tasks. Act, don't explain."
 )
+
 
 # ═══════════════════════════════════════════════════════════
 #  FROM s01 (unchanged)
@@ -189,66 +191,95 @@ TOOL_HANDLERS = {
     "glob": run_glob,
 }
 
-# Gate 1: Hard deny list — always forbidden
+# -- New in s04: hook system (s03 permission logic now uses hooks) --
+HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []}
+
+
+def register_hook(event: str, callback):
+    HOOKS[event].append(callback)
+
+
+def trigger_hooks(event: str, *args):
+    for callback in HOOKS[event]:
+        result = callback(*args)
+        if result is not None:  # A hook result blocks this tool call.
+            return result
+    return None
+
+
+# s03 permission check logic, now wrapped as a hook
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
+DESTRUCTIVE_COMMAND_WORD = re.compile(
+    r"(?i)(?:^|[;&|()\n])\s*(?:rm|del)(?=\s|$|[;&|()])"
+)
+DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
 
 
-def check_deny_list(command: str) -> str | None:
-    for pattern in DENY_LIST:
-        if pattern in command:
-            return f"Blocked: '{pattern}' is on the deny list"
-    return None
+def contains_destructive_command(command) -> bool:
+    return bool(DESTRUCTIVE_COMMAND_WORD.search(command))
 
 
-# Gate 2: Rule matching — context-dependent checks
-PERMISSION_RULES = [
-    {
-        "tools": ["write_file", "edit_file"],
-        "check": lambda args: not (WORKDIR / args.get("path", ""))
-        .resolve()
-        .is_relative_to(WORKDIR),
-        "message": "Writing outside workspace",
-    },
-    {
-        "tools": ["bash"],
-        "check": lambda args: any(
-            kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]
-        ),
-        "message": "Potentially destructive command",
-    },
-]
-
-
-def check_rules(tool_name: str, args: dict) -> str | None:
-    for rule in PERMISSION_RULES:
-        if tool_name in rule["tools"] and rule["check"](args):
-            return rule["message"]
-    return None
-
-
-# Gate 3: User approval — wait for confirmation after rule match
-def ask_user(tool_name: str, args: dict, reason: str) -> str:
-    print(f"\n\033[33m⚠  {reason}\033[0m")
-    print(f"   Tool: {tool_name}({args})")
-    choice = input("   Allow? [y/N] ").strip().lower()
-    return "allow" if choice in ("y", "yes") else "deny"
-
-
-# Pipeline: all three gates chained
-def check_permission(block) -> bool:
+def permission_hook(block):
+    """PreToolUse: s03 check_permission() logic moved here."""
     if block.name == "bash":
-        reason = check_deny_list(block.input.get("command", ""))
-        if reason:
-            print(f"\n\033[31m⛔ {reason}\033[0m")
-            return False
-    reason = check_rules(block.name, block.input)
-    if reason:
-        decision = ask_user(block.name, block.input, reason)
-        if decision == "deny":
-            return False
-    return True
+        command = block.input.get("command", "")
+        for pattern in DENY_LIST:
+            if pattern in command:
+                print(f"\n\033[31m[blocked] '{pattern}'\033[0m")
+                return "Permission denied by deny list"
+        if contains_destructive_command(command) or any(
+                kw in command for kw in DESTRUCTIVE
+        ):
+            print(f"\n\033[33m[permission] Potentially destructive command\033[0m")
+            print(f"   Tool: {block.name}({block.input})")
+            choice = input("   Allow? [y/N] ").strip().lower()
+            if choice not in ("y", "yes"):
+                return "Permission denied by user"
+    if block.name in ("read_file", "write_file", "edit_file"):
+        path = block.input.get("path", "")
+        if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
+            print(f"\n\033[33m[permission] Access outside workspace\033[0m")
+            print(f"   Tool: {block.name}({block.input})")
+            choice = input("   Allow? [y/N] ").strip().lower()
+            if choice not in ("y", "yes"):
+                return "Permission denied by user"
+    return None
 
 
+def log_hook(block):
+    """PreToolUse: log every tool call."""
+    args_preview = str(list(block.input.values())[:2])[:60]
+    print(f"\033[90m[HOOK] {block.name}({args_preview})\033[0m")
+    return None
+
+
+def large_output_hook(block, output):
+    """PostToolUse: warn on large output."""
+    if len(str(output)) > 100000:
+        print(f"\033[33m[HOOK] Large output from {block.name}: {len(str(output))} chars\033[0m")
+    return None
+
+
+# UserPromptSubmit hook: log user input before it reaches the LLM
+def context_inject_hook(query: str):
+    print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
+    return None
+
+
+# Stop hook: print summary when loop is about to exit
+def summary_hook(messages: list):
+    tool_count = sum(1 for m in messages
+                     for b in (m.get("content") if isinstance(m.get("content"), list) else [])
+                     if isinstance(b, dict) and b.get("type") == "tool_result")
+    print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
+    return None
+
+
+register_hook("UserPromptSubmit", context_inject_hook)
+register_hook("PreToolUse", permission_hook)
+register_hook("PreToolUse", log_hook)
+register_hook("PostToolUse", large_output_hook)
+register_hook("Stop", summary_hook)
 
 def agent_loop(messages: list):
     while True:
@@ -263,56 +294,52 @@ def agent_loop(messages: list):
         # Append assistant turn
         messages.append({"role": "assistant", "content": response.content})
 
-        # If the model didn't call a tool, we're done
-        if response.stop_reason != "tool_use":
+        tool_calls = [
+            block for block in response.content if block.type == "tool_use"
+        ]
+        if not tool_calls:
+            force = trigger_hooks("Stop", messages)
+            if force:
+                messages.append({"role": "user", "content": force})
+                continue
             return
-
-        # Execute each tool call, collect results
         results = []
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
-
-            print(f"\033[33m> {block.name}\033[0m")
-
-            # s03 change: run through permission pipeline before executing
-            if not check_permission(block):
+        for block in tool_calls:
+            blocked = trigger_hooks("PreToolUse", block)
+            if blocked:
                 results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": "Permission denied by the user. "
-                                "Do not retry this action or suggest workarounds "
-                                "(e.g. sudo, chmod) to bypass it."})
+                                "content": str(blocked)})
                 continue
-
             handler = TOOL_HANDLERS.get(block.name)
             output = handler(**block.input) if handler else f"Unknown: {block.name}"
-            print(str(output)[:200])
-            results.append(
-                {"type": "tool_result", "tool_use_id": block.id, "content": output}
-            )
 
-        # Feed tool results back, loop continues
+            trigger_hooks("PostToolUse", block, output)  # s04: post hook
+
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+
         messages.append({"role": "user", "content": results})
 
 
 # ── Entry point ──────────────────────────────────────────
 if __name__ == "__main__":
-    print("s03: Permission")
-    print("输入问题，回车发送。输入 q 退出。\n")
+    print("s04: Hooks - extension logic on hooks, loop stays clean")
+    print("Enter a question, press Enter to send. Type q to quit.\n")
 
     history = []
     while True:
         try:
-            query = input("\033[36ms03 >> \033[0m")
+            # \001/\002 tell Readline the ANSI escapes have zero display width.
+            query = input("\001\033[36m\002s04 >> \001\033[0m\002")
         except (EOFError, KeyboardInterrupt):
             break
-        if query.strip().lower() in ("q", "exit", ""):
+        if not query.strip():
+            continue
+        if query.strip().lower() in ("q", "exit"):
             break
+        trigger_hooks("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        # Print the model's final text response
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if getattr(block, "type", None) == "text":
-                    print(block.text)
+        for block in history[-1]["content"]:
+            if getattr(block, "type", None) == "text":
+                print(block.text)
         print()
