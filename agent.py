@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 
-import logging
+import logging, json
 import os
 import subprocess
 from pathlib import Path
 import re
-
+import ast
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
@@ -14,11 +14,7 @@ from config import setup_logging
 try:
     import readline
 
-    # macOS 的 libedit 在处理中文输入时有退格问题，这四行修复它
-    readline.parse_and_bind("set bind-tty-special-chars off")
-    readline.parse_and_bind("set input-meta on")
-    readline.parse_and_bind("set output-meta on")
-    readline.parse_and_bind("set convert-meta off")
+    readline.parse_and_bind('set bind-tty-special-chars off')
 except ImportError:
     pass
 
@@ -38,49 +34,35 @@ client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL", ""))
 MODEL = os.getenv("MODEL_ID", "")
 WORKDIR = Path.cwd()
 
+# s05 change: SYSTEM prompt adds planning guidance
+ENVIRONMENT_PROMPT = (
+    "Windows: the bash tool runs through cmd.exe; use cmd.exe syntax, not Unix "
+    "Bash or PowerShell syntax, and prefer dedicated file tools for file operations"
+    if os.name == "nt"
+    else "Unix-like: the bash tool runs the system shell"
+)
 SYSTEM = (
-    f"You are a coding agent at {WORKDIR}. Use bash to solve tasks. Act, don't explain."
+    f"You are a coding agent at {WORKDIR}. Environment: {ENVIRONMENT_PROMPT}. "
+    "Before starting any multi-step task, use todo_write to plan your steps. "
+    "Update status as you go."
 )
 
 
-# ═══════════════════════════════════════════════════════════
-#  FROM s01 (unchanged)
-# ═══════════════════════════════════════════════════════════
-
+# -- Tool implementations from s02-s04 --
 
 def run_bash(command: str) -> str:
     try:
-        r = subprocess.run(
-            command,
-            shell=True,
-            cwd=WORKDIR,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
+        r = subprocess.run(command, shell=True, cwd=WORKDIR,
+                           capture_output=True, text=True, errors="replace", timeout=120)
         out = (r.stdout + r.stderr).strip()
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
-    except (FileNotFoundError, OSError) as e:
-        return f"Error: {e}"
-
-
-# ═══════════════════════════════════════════════════════════
-#  NEW in s02: 4 个新工具
-# ═══════════════════════════════════════════════════════════
-
-
-def safe_path(p: str) -> Path:
-    path = (WORKDIR / p).resolve()
-    if not path.is_relative_to(WORKDIR):
-        raise ValueError(f"Path escapes workspace: {p}")
-    return path
 
 
 def run_read(path: str, limit: int | None = None) -> str:
     try:
-        lines = safe_path(path).read_text().splitlines()
+        lines = (WORKDIR / path).resolve().read_text(encoding="utf-8").splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)
@@ -90,9 +72,9 @@ def run_read(path: str, limit: int | None = None) -> str:
 
 def run_write(path: str, content: str) -> str:
     try:
-        file_path = safe_path(path)
+        file_path = (WORKDIR / path).resolve()
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content)
+        file_path.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -100,11 +82,11 @@ def run_write(path: str, content: str) -> str:
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
-        file_path = safe_path(path)
-        text = file_path.read_text()
+        file_path = (WORKDIR / path).resolve()
+        text = file_path.read_text(encoding="utf-8")
         if old_text not in text:
             return f"Error: text not found in {path}"
-        file_path.write_text(text.replace(old_text, new_text, 1))
+        file_path.write_text(text.replace(old_text, new_text, 1), encoding="utf-8")
         return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -112,76 +94,119 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 def run_glob(pattern: str) -> str:
     import glob as g
-
     try:
-        results = []
-        for match in g.glob(pattern, root_dir=WORKDIR):
-            if (WORKDIR / match).resolve().is_relative_to(WORKDIR):
-                results.append(match)
-        return "\n".join(results) if results else "(no matches)"
+        matches = sorted({
+            match for match in g.glob(
+                pattern, root_dir=WORKDIR, recursive=True)
+            if (WORKDIR / match).resolve().is_relative_to(WORKDIR)
+        })
+        shown = matches[:200]
+        if len(matches) > 200:
+            shown.append("... (more matches omitted; narrow the pattern)")
+        return "\n".join(shown) if shown else "(no matches)"
     except Exception as e:
         return f"Error: {e}"
 
 
-# ═══════════════════════════════════════════════════════════
-#  NEW in s02: 工具定义（s01 只有一个 bash，现在扩展到 5 个）
-# ═══════════════════════════════════════════════════════════
+# -- New in s05: structured state the model updates --
+
+class TodoManager:
+    def __init__(self):
+        self.items: list[dict] = []
+
+    def update(self, todos: list | str) -> str:
+        if isinstance(todos, str):
+            try:
+                todos = json.loads(todos)
+            except json.JSONDecodeError:
+                try:
+                    todos = ast.literal_eval(todos)
+                except (SyntaxError, ValueError) as e:
+                    raise ValueError("todos must be a list or JSON array string") from e
+
+        if not isinstance(todos, list):
+            raise ValueError("todos must be a list")
+        if len(todos) > 20:
+            raise ValueError("Max 20 todos allowed")
+
+        validated = []
+        in_progress_count = 0
+        for index, todo in enumerate(todos):
+            if not isinstance(todo, dict):
+                raise ValueError(f"todos[{index}] must be an object")
+
+            content = str(todo.get("content", "")).strip()
+            status = str(todo.get("status", "pending")).lower()
+            if not content:
+                raise ValueError(f"todos[{index}] requires content")
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"todos[{index}] has invalid status '{status}'")
+            if status == "in_progress":
+                in_progress_count += 1
+            validated.append({"content": content, "status": status})
+
+        if in_progress_count > 1:
+            raise ValueError("Only one todo can be in_progress at a time")
+
+        self.items = validated
+        return self.render()
+
+    def render(self) -> str:
+        if not self.items:
+            return "No todos."
+
+        lines = []
+        for todo in self.items:
+            marker = {
+                "pending": "[ ]",
+                "in_progress": "[>]",
+                "completed": "[x]",
+            }[todo["status"]]
+            lines.append(f"{marker} {todo['content']}")
+
+        done = sum(todo["status"] == "completed" for todo in self.items)
+        lines.append(f"\n({done}/{len(self.items)} completed)")
+        return "\n".join(lines)
+
+
+TODO = TodoManager()
+
+
+def run_todo_write(todos: list | str) -> str:
+    try:
+        output = TODO.update(todos)
+    except ValueError as e:
+        return f"Error: {e}"
+    print(f"\n\033[33m## Current Tasks\033[0m\n{output}")
+    return output
+
 
 TOOLS = [
-    {
-        "name": "bash",
-        "description": "Run a shell command.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"command": {"type": "string"}},
-            "required": ["command"],
-        },
-    },
-    {
-        "name": "read_file",
-        "description": "Read file contents.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}},
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "write_file",
-        "description": "Write content to a file.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-            "required": ["path", "content"],
-        },
-    },
-    {
-        "name": "edit_file",
-        "description": "Replace exact text in a file once.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "old_text": {"type": "string"},
-                "new_text": {"type": "string"},
-            },
-            "required": ["path", "old_text", "new_text"],
-        },
-    },
-    {
-        "name": "glob",
-        "description": "Find files matching a glob pattern.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"pattern": {"type": "string"}},
-            "required": ["pattern"],
-        },
-    },
+    {"name": "bash", "description": "Run a shell command.",
+     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+    {"name": "read_file", "description": "Read file contents.",
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}},
+                      "required": ["path"]}},
+    {"name": "write_file", "description": "Write content to a file.",
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                      "required": ["path", "content"]}},
+    {"name": "edit_file", "description": "Replace exact text in a file once.",
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"},
+                                                       "new_text": {"type": "string"}},
+                      "required": ["path", "old_text", "new_text"]}},
+    {"name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
+     "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+    # s05: new tool
+    {"name": "todo_write", "description": "Create and manage a task list for your current coding session.",
+     "input_schema": {"type": "object", "properties": {"todos": {"type": "array", "maxItems": 20,
+                                                                 "items": {"type": "object", "properties": {
+                                                                     "content": {"type": "string", "minLength": 1},
+                                                                     "status": {"type": "string",
+                                                                                "enum": ["pending", "in_progress",
+                                                                                         "completed"]}},
+                                                                           "required": ["content", "status"]}}},
+                      "required": ["todos"]}},
 ]
-
-# ═══════════════════════════════════════════════════════════
-#  NEW in s02: 工具分发映射（s01 是硬编码 run_bash，现在改为查表）
-# ═══════════════════════════════════════════════════════════
 
 TOOL_HANDLERS = {
     "bash": run_bash,
@@ -189,6 +214,7 @@ TOOL_HANDLERS = {
     "write_file": run_write,
     "edit_file": run_edit,
     "glob": run_glob,
+    "todo_write": run_todo_write,
 }
 
 # -- New in s04: hook system (s03 permission logic now uses hooks) --
@@ -281,17 +307,14 @@ register_hook("PreToolUse", log_hook)
 register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", summary_hook)
 
+
 def agent_loop(messages: list):
+    rounds_since_todo = 0
     while True:
         response = client.messages.create(
-            model=MODEL,
-            system=SYSTEM,
-            messages=messages,
-            tools=TOOLS,
+            model=MODEL, system=SYSTEM, messages=messages, tools=TOOLS,
             max_tokens=8000,
         )
-
-        # Append assistant turn
         messages.append({"role": "assistant", "content": response.content})
 
         tool_calls = [
@@ -304,6 +327,7 @@ def agent_loop(messages: list):
                 continue
             return
         results = []
+        used_todo = False
         for block in tool_calls:
             blocked = trigger_hooks("PreToolUse", block)
             if blocked:
@@ -311,25 +335,37 @@ def agent_loop(messages: list):
                                 "content": str(blocked)})
                 continue
             handler = TOOL_HANDLERS.get(block.name)
-            output = handler(**block.input) if handler else f"Unknown: {block.name}"
+            try:
+                output = handler(**block.input) if handler else f"Unknown: {block.name}"
+            except Exception as e:
+                output = f"Error: {e}"
 
             trigger_hooks("PostToolUse", block, output)  # s04: post hook
 
-            results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+            if block.name == "todo_write":
+                used_todo = True
+
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+
+        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
+        if rounds_since_todo >= 3:
+            results.append({"type": "text",
+                            "text": "<reminder>Update your todos.</reminder>"})
+            rounds_since_todo = 0
 
         messages.append({"role": "user", "content": results})
 
 
 # ── Entry point ──────────────────────────────────────────
 if __name__ == "__main__":
-    print("s04: Hooks - extension logic on hooks, loop stays clean")
+    print("s05: TodoWrite - plan before execution")
     print("Enter a question, press Enter to send. Type q to quit.\n")
 
     history = []
     while True:
         try:
             # \001/\002 tell Readline the ANSI escapes have zero display width.
-            query = input("\001\033[36m\002s04 >> \001\033[0m\002")
+            query = input("\001\033[36m\002s05 >> \001\033[0m\002")
         except (EOFError, KeyboardInterrupt):
             break
         if not query.strip():
